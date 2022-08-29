@@ -9,19 +9,11 @@ where
     C: Configuration,
 {
     pub fn fetch(&self, db: &DynDb<C>, key: C::Key) -> &C::Value {
-        let runtime = db.runtime();
-
-        runtime.unwind_if_revision_cancelled(db);
-
         let StampedValue {
             value,
             durability,
             changed_at,
-        } = self.compute_value(db, key);
-
-        if let Some(evicted) = self.lru.record_use(key.as_id()) {
-            self.evict(AsId::from_id(evicted));
-        }
+        } = self.fetch_untracked(db, key);
 
         db.runtime().report_tracked_read(
             self.database_key_index(key).into(),
@@ -30,6 +22,20 @@ where
         );
 
         value
+    }
+
+    pub(super) fn fetch_untracked(&self, db: &DynDb<C>, key: C::Key) -> StampedValue<&C::Value> {
+        let runtime = db.runtime();
+
+        runtime.unwind_if_revision_cancelled(db);
+
+        let stamp = self.compute_value(db, key);
+
+        if let Some(evicted) = self.lru.record_use(key.as_id()) {
+            self.evict(AsId::from_id(evicted));
+        }
+
+        stamp
     }
 
     #[inline]

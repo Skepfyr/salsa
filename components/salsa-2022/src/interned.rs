@@ -23,13 +23,7 @@ impl<T: AsId> InternedId for T {}
 pub trait InternedData: Sized + Eq + Hash + Clone {}
 impl<T: Eq + Hash + Clone> InternedData for T {}
 
-/// The interned ingredient has the job of hashing values of type `Data` to produce an `Id`.
-/// It used to store interned structs but also to store the id fields of a tracked struct.
-/// Interned values endure until they are explicitly removed in some way.
-pub struct InternedIngredient<Id: InternedId, Data: InternedData> {
-    /// Index of this ingredient in the database (used to construct database-ids, etc).
-    ingredient_index: IngredientIndex,
-
+pub(crate) struct Interner<Id: InternedId, Data: InternedData> {
     /// Maps from data to the existing interned id for that data.
     ///
     /// Deadlock requirement: We access `key_map` while holding lock on `value_map`, but not vice versa.
@@ -43,46 +37,35 @@ pub struct InternedIngredient<Id: InternedId, Data: InternedData> {
     /// counter for the next id.
     counter: AtomicCell<u32>,
 
-    /// Stores the revision when this interned ingredient was last cleared.
-    /// You can clear an interned table at any point, deleting all its entries,
-    /// but that will make anything dependent on those entries dirty and in need
-    /// of being recomputed.
-    reset_at: Revision,
-
     /// When specific entries are deleted from the interned table, their data is added
     /// to this vector rather than being immediately freed. This is because we may` have
     /// references to that data floating about that are tied to the lifetime of some
     /// `&db` reference. This queue itself is not freed until we have an `&mut db` reference,
     /// guaranteeing that there are no more references to it.
     deleted_entries: SegQueue<Box<Data>>,
-
-    debug_name: &'static str,
 }
 
-impl<Id, Data> InternedIngredient<Id, Data>
+impl<Id, Data> Default for Interner<Id, Data>
 where
     Id: InternedId,
     Data: InternedData,
 {
-    pub fn new(ingredient_index: IngredientIndex, debug_name: &'static str) -> Self {
+    fn default() -> Self {
         Self {
-            ingredient_index,
             key_map: Default::default(),
             value_map: Default::default(),
-            counter: AtomicCell::default(),
-            reset_at: Revision::start(),
+            counter: Default::default(),
             deleted_entries: Default::default(),
-            debug_name,
         }
     }
+}
 
-    pub fn intern(&self, runtime: &Runtime, data: Data) -> Id {
-        runtime.report_tracked_read(
-            DependencyIndex::for_table(self.ingredient_index),
-            Durability::MAX,
-            self.reset_at,
-        );
-
+impl<Id, Data> Interner<Id, Data>
+where
+    Id: InternedId,
+    Data: InternedData,
+{
+    pub fn intern(&self, data: Data) -> Id {
         if let Some(id) = self.key_map.get(&data) {
             return *id;
         }
@@ -104,25 +87,8 @@ where
         }
     }
 
-    pub(crate) fn reset_at(&self) -> Revision {
-        self.reset_at
-    }
-
-    pub fn reset(&mut self, revision: Revision) {
-        assert!(revision > self.reset_at);
-        self.reset_at = revision;
-        self.key_map.clear();
-        self.value_map.clear();
-    }
-
     #[track_caller]
-    pub fn data<'db>(&'db self, runtime: &'db Runtime, id: Id) -> &'db Data {
-        runtime.report_tracked_read(
-            DependencyIndex::for_table(self.ingredient_index),
-            Durability::MAX,
-            self.reset_at,
-        );
-
+    pub fn data(&self, id: Id) -> &Data {
         let data = match self.value_map.get(&id) {
             Some(d) => d,
             None => {
@@ -136,9 +102,9 @@ where
         unsafe { transmute_lifetime(self, &**data) }
     }
 
-    /// Get the ingredient index for this table.
-    pub(super) fn ingredient_index(&self) -> IngredientIndex {
-        self.ingredient_index
+    pub fn clear(&mut self) {
+        self.key_map.clear();
+        self.value_map.clear();
     }
 
     /// Deletes an index from the interning table, making it available for re-use.
@@ -176,6 +142,83 @@ where
 
     pub(crate) fn clear_deleted_indices(&mut self) {
         std::mem::take(&mut self.deleted_entries);
+    }
+}
+
+/// The interned ingredient has the job of hashing values of type `Data` to produce an `Id`.
+/// It used to store interned structs but also to store the id fields of a tracked struct.
+/// Interned values endure until they are explicitly removed in some way.
+pub struct InternedIngredient<Id: InternedId, Data: InternedData> {
+    /// Index of this ingredient in the database (used to construct database-ids, etc).
+    ingredient_index: IngredientIndex,
+
+    interner: Interner<Id, Data>,
+
+    /// Stores the revision when this interned ingredient was last cleared.
+    /// You can clear an interned table at any point, deleting all its entries,
+    /// but that will make anything dependent on those entries dirty and in need
+    /// of being recomputed.
+    reset_at: Revision,
+
+    debug_name: &'static str,
+}
+
+impl<Id, Data> InternedIngredient<Id, Data>
+where
+    Id: InternedId,
+    Data: InternedData,
+{
+    pub fn new(ingredient_index: IngredientIndex, debug_name: &'static str) -> Self {
+        Self {
+            ingredient_index,
+            interner: Default::default(),
+            reset_at: Revision::start(),
+            debug_name,
+        }
+    }
+
+    pub fn intern(&self, runtime: &Runtime, data: Data) -> Id {
+        runtime.report_tracked_read(
+            DependencyIndex::for_table(self.ingredient_index),
+            Durability::MAX,
+            self.reset_at,
+        );
+
+        self.interner.intern(data)
+    }
+
+    pub(crate) fn reset_at(&self) -> Revision {
+        self.reset_at
+    }
+
+    pub fn reset(&mut self, revision: Revision) {
+        assert!(revision > self.reset_at);
+        self.reset_at = revision;
+        self.interner.clear();
+    }
+
+    #[track_caller]
+    pub fn data<'db>(&'db self, runtime: &'db Runtime, id: Id) -> &'db Data {
+        runtime.report_tracked_read(
+            DependencyIndex::for_table(self.ingredient_index),
+            Durability::MAX,
+            self.reset_at,
+        );
+
+        self.interner.data(id)
+    }
+
+    /// Get the ingredient index for this table.
+    pub(super) fn ingredient_index(&self) -> IngredientIndex {
+        self.ingredient_index
+    }
+
+    pub(crate) fn delete_index(&self, id: Id) {
+        self.interner.delete_index(id)
+    }
+
+    pub(crate) fn clear_deleted_indices(&mut self) {
+        self.interner.clear_deleted_indices()
     }
 }
 

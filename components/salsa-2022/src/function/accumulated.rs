@@ -21,7 +21,7 @@ where
         A: Accumulator,
     {
         // To start, ensure that the value is up to date:
-        self.fetch(db, key);
+        self.fetch_untracked(db, key);
 
         // Now walk over all the things that the value depended on
         // and find the values they accumulated into the given
